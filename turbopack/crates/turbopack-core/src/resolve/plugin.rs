@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rustc_hash::FxHashSet;
 use turbo_rcstr::RcStr;
-use turbo_tasks::{ResolvedVc, Vc};
+use turbo_tasks::{ReadRef, ResolvedVc, Vc};
 use turbo_tasks_fs::{FileSystemPath, glob::Glob};
 
 use crate::{
@@ -10,50 +10,42 @@ use crate::{
 };
 
 /// A condition which determines if the hooks of a resolve plugin gets called.
-#[turbo_tasks::value(shared)]
-pub enum AfterResolvePluginCondition {
-    Glob {
-        root: FileSystemPath,
-        glob: ResolvedVc<Glob>,
-    },
-    Always,
-    Never,
+///
+/// The glob is read at construction time and stored as a `ReadRef`, so `matches` is a pure
+/// sync function. `serialization = "none"` because `ReadRef` cannot be persisted across builds
+/// — plugin construction is cheap enough that re-deriving this on restore is preferable.
+#[turbo_tasks::value(serialization = "none")]
+pub struct AfterResolvePluginCondition {
+    root: FileSystemPath,
+    glob: ReadRef<Glob>,
 }
 
 #[turbo_tasks::value_impl]
 impl AfterResolvePluginCondition {
     #[turbo_tasks::function]
-    pub fn new_with_glob(root: FileSystemPath, glob: ResolvedVc<Glob>) -> Vc<Self> {
-        AfterResolvePluginCondition::Glob { root, glob }.cell()
+    pub async fn new_with_glob(root: FileSystemPath, glob: ResolvedVc<Glob>) -> Result<Vc<Self>> {
+        let glob = glob.await?;
+        Ok(AfterResolvePluginCondition { root, glob }.cell())
     }
 }
 
-#[turbo_tasks::value_impl]
 impl AfterResolvePluginCondition {
-    #[turbo_tasks::function]
-    pub async fn matches(&self, fs_path: FileSystemPath) -> Result<Vc<bool>> {
-        match self {
-            AfterResolvePluginCondition::Glob { root, glob } => {
-                let path = fs_path;
-
-                if let Some(path) = root.get_path_to(&path)
-                    && glob.await?.matches(path)
-                {
-                    return Ok(Vc::cell(true));
-                }
-
-                Ok(Vc::cell(false))
-            }
-            AfterResolvePluginCondition::Always => Ok(Vc::cell(true)),
-            AfterResolvePluginCondition::Never => Ok(Vc::cell(false)),
-        }
+    /// Test whether `fs_path` matches this condition.
+    pub fn matches(&self, fs_path: &FileSystemPath) -> bool {
+        self.root
+            .get_path_to(fs_path)
+            .is_some_and(|p| self.glob.matches(p))
     }
 }
 
 /// A condition which determines if the hooks of a resolve plugin gets called.
-#[turbo_tasks::value(shared)]
+///
+/// The glob (when present) is read at construction time and stored as a `ReadRef`, so
+/// `matches` is a pure sync function. `serialization = "none"` because `ReadRef` cannot be
+/// persisted across builds.
+#[turbo_tasks::value(serialization = "none")]
 pub enum BeforeResolvePluginCondition {
-    Request(ResolvedVc<Glob>),
+    Request(ReadRef<Glob>),
     Modules(FxHashSet<RcStr>),
     Always,
     Never,
@@ -67,22 +59,21 @@ impl BeforeResolvePluginCondition {
     }
 
     #[turbo_tasks::function]
-    pub fn from_request_glob(glob: ResolvedVc<Glob>) -> Vc<Self> {
-        BeforeResolvePluginCondition::Request(glob).cell()
+    pub async fn from_request_glob(glob: ResolvedVc<Glob>) -> Result<Vc<Self>> {
+        Ok(BeforeResolvePluginCondition::Request(glob.await?).cell())
     }
 }
 
-#[turbo_tasks::value_impl]
 impl BeforeResolvePluginCondition {
-    #[turbo_tasks::function]
-    pub async fn matches(&self, request: Vc<Request>) -> Result<Vc<bool>> {
-        Ok(Vc::cell(match self {
-            BeforeResolvePluginCondition::Request(glob) => match request.await?.request() {
-                Some(request) => glob.await?.matches(request.as_str()),
+    /// Test whether `request` matches this condition.
+    pub fn matches(&self, request: &Request) -> bool {
+        match self {
+            BeforeResolvePluginCondition::Request(glob) => match request.request() {
+                Some(request) => glob.matches(request.as_str()),
                 None => false,
             },
             BeforeResolvePluginCondition::Modules(modules) => {
-                if let Request::Module { module, .. } = &*request.await? {
+                if let Request::Module { module, .. } = request {
                     modules.iter().any(|m| module.is_match(m))
                 } else {
                     false
@@ -90,15 +81,25 @@ impl BeforeResolvePluginCondition {
             }
             BeforeResolvePluginCondition::Always => true,
             BeforeResolvePluginCondition::Never => false,
-        }))
+        }
     }
 }
 
 #[turbo_tasks::value_trait]
 pub trait BeforeResolvePlugin {
-    #[turbo_tasks::function]
-    fn before_resolve_condition(self: Vc<Self>) -> Vc<BeforeResolvePluginCondition>;
+    /// A condition which determines if the hooks gets called.
+    ///
+    /// This is not a `#[turbo_tasks::function]` — implementations should compute and resolve
+    /// the condition once during construction and store it on the plugin.
+    fn before_resolve_condition(&self) -> Vc<BeforeResolvePluginCondition>;
 
+    /// This hook runs before full resolution. If a value is returned it replaces the resolve
+    /// result.
+    ///
+    /// This is a `#[turbo_tasks::function]` so that virtual sources/results minted inside it
+    /// are cached by `(self, lookup_path, reference_type, request)`. Without memoization,
+    /// multiple callers that synthesize the "same" virtual module end up with distinct cells
+    /// and distinct module-graph nodes with duplicate idents.
     #[turbo_tasks::function]
     fn before_resolve(
         self: Vc<Self>,
@@ -111,12 +112,20 @@ pub trait BeforeResolvePlugin {
 #[turbo_tasks::value_trait]
 pub trait AfterResolvePlugin {
     /// A condition which determines if the hooks gets called.
-    #[turbo_tasks::function]
-    fn after_resolve_condition(self: Vc<Self>) -> Vc<AfterResolvePluginCondition>;
+    ///
+    /// This is not a `#[turbo_tasks::function]` — implementations should compute and resolve
+    /// the condition once during construction and store it on the plugin, so this becomes a
+    /// trivial field read.
+    fn after_resolve_condition(&self) -> Vc<AfterResolvePluginCondition>;
 
     /// This hook gets called when a full filepath has been resolved and the
     /// condition matches. If a value is returned it replaces the resolve
     /// result.
+    ///
+    /// This is a `#[turbo_tasks::function]` so that virtual sources/results minted inside it
+    /// are cached by `(self, fs_path, lookup_path, reference_type, request)`. Without
+    /// memoization, multiple callers that synthesize the "same" replacement end up with
+    /// distinct cells and distinct module-graph nodes with duplicate idents.
     #[turbo_tasks::function]
     fn after_resolve(
         self: Vc<Self>,

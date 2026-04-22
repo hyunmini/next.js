@@ -111,7 +111,7 @@ async fn plain_chunk_items_with_info(
             } = chunk_item_with_info;
 
             let asset_ident = chunk_item.asset_ident().to_string();
-            let ty = chunk_item.ty();
+            let ty = chunk_item.into_trait_ref().await?.ty();
             let chunk_item_size =
                 ty.chunk_item_size(chunking_context, *chunk_item, async_info.map(|info| *info));
 

@@ -453,16 +453,14 @@ pub trait ChunkItem: OutputAssetsReference {
     }
 
     /// The type of chunk this item should be assembled into.
-    #[turbo_tasks::function]
-    fn ty(self: Vc<Self>) -> Vc<Box<dyn ChunkType>>;
+    fn ty(&self) -> Vc<Box<dyn ChunkType>>;
 
     /// A temporary method to retrieve the module associated with this
     /// ChunkItem. TODO: Remove this as part of the chunk refactoring.
     #[turbo_tasks::function]
     fn module(self: Vc<Self>) -> Vc<Box<dyn Module>>;
 
-    #[turbo_tasks::function]
-    fn chunking_context(self: Vc<Self>) -> Vc<Box<dyn ChunkingContext>>;
+    fn chunking_context(&self) -> Vc<Box<dyn ChunkingContext>>;
 }
 
 #[turbo_tasks::value_trait]
@@ -535,6 +533,8 @@ where
     async fn id(self: Vc<Self>) -> Result<ModuleId> {
         let chunk_item = Vc::upcast_non_strict(self);
         chunk_item
+            .into_trait_ref()
+            .await?
             .chunking_context()
             .chunk_item_id_strategy()
             .await?

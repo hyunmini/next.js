@@ -17,8 +17,8 @@ use tracing::{Instrument, Level};
 use turbo_frozenmap::{FrozenMap, FrozenSet};
 use turbo_rcstr::{RcStr, rcstr};
 use turbo_tasks::{
-    FxIndexMap, FxIndexSet, NonLocalValue, ReadRef, ResolvedVc, TaskInput, TryFlatJoinIterExt,
-    TryJoinIterExt, ValueToString, ValueToStringRef, Vc, trace::TraceRawVcs,
+    FxIndexMap, NonLocalValue, ReadRef, ResolvedVc, TaskInput, TryFlatJoinIterExt, TryJoinIterExt,
+    ValueToString, ValueToStringRef, Vc, trace::TraceRawVcs,
 };
 use turbo_tasks_fs::{FileSystemEntryType, FileSystemPath};
 use turbo_unix_path::normalize_request;
@@ -31,8 +31,8 @@ use crate::{
         Issue, IssueExt, IssueSource, module::emit_unknown_module_type_error,
         resolve::ResolvingIssue,
     },
-    module::{Module, Modules, OptionModule},
-    output::{OutputAsset, OutputAssets},
+    module::Module,
+    output::OutputAsset,
     package_json::{PackageJsonIssue, read_package_json},
     raw_module::RawModule,
     reference_type::ReferenceType,
@@ -50,7 +50,7 @@ use crate::{
         plugin::{AfterResolvePlugin, AfterResolvePluginCondition, BeforeResolvePlugin},
         remap::{ExportsField, ImportsField, ReplacedSubpathValueResult},
     },
-    source::{OptionSource, Source, Sources},
+    source::Source,
 };
 
 mod alias_map;
@@ -84,7 +84,7 @@ pub enum ResolveErrorMode {
 /// Type alias for a resolved after-resolve plugin paired with its condition.
 type AfterResolvePluginWithCondition = (
     ResolvedVc<Box<dyn AfterResolvePlugin>>,
-    ResolvedVc<AfterResolvePluginCondition>,
+    ReadRef<AfterResolvePluginCondition>,
 );
 
 #[turbo_tasks::value(shared)]
@@ -106,6 +106,10 @@ pub enum ModuleResolveResultItem {
     /// Resolve the reference to an empty module.
     Empty,
     Custom(u8),
+    /// A duplicate of an item that appeared earlier in the primary array.
+    /// The usize is the index of the first occurrence. Most callers should skip
+    /// this variant.
+    Duplicate(usize),
 }
 
 impl ModuleResolveResultItem {
@@ -260,11 +264,13 @@ impl ModuleResolveResult {
     pub fn modules(
         modules: impl IntoIterator<Item = (RequestKey, ResolvedVc<Box<dyn Module>>)>,
     ) -> ResolvedVc<Self> {
+        let mut primary: Vec<_> = modules
+            .into_iter()
+            .map(|(k, v)| (k, ModuleResolveResultItem::Module(v)))
+            .collect();
+        Self::mark_duplicates(&mut primary);
         ModuleResolveResult {
-            primary: modules
-                .into_iter()
-                .map(|(k, v)| (k, ModuleResolveResultItem::Module(v)))
-                .collect(),
+            primary: primary.into_boxed_slice(),
             affecting_sources: Default::default(),
         }
         .resolved_cell()
@@ -274,11 +280,13 @@ impl ModuleResolveResult {
         modules: impl IntoIterator<Item = (RequestKey, ResolvedVc<Box<dyn Module>>)>,
         affecting_sources: Vec<ResolvedVc<Box<dyn Source>>>,
     ) -> ResolvedVc<Self> {
+        let mut primary: Vec<_> = modules
+            .into_iter()
+            .map(|(k, v)| (k, ModuleResolveResultItem::Module(v)))
+            .collect();
+        Self::mark_duplicates(&mut primary);
         ModuleResolveResult {
-            primary: modules
-                .into_iter()
-                .map(|(k, v)| (k, ModuleResolveResultItem::Module(v)))
-                .collect(),
+            primary: primary.into_boxed_slice(),
             affecting_sources: affecting_sources.into_boxed_slice(),
         }
         .resolved_cell()
@@ -286,6 +294,34 @@ impl ModuleResolveResult {
 }
 
 impl ModuleResolveResult {
+    /// Marks duplicate items as `Duplicate(first_index)` in place.
+    /// Preserves ordering; the first occurrence stays, subsequent occurrences
+    /// of the same module/output asset become `Duplicate`.
+    fn mark_duplicates(primary: &mut [(RequestKey, ModuleResolveResultItem)]) {
+        // Map from module/asset identity to the index of first occurrence
+        let mut seen_modules = FxHashMap::default();
+        let mut seen_output_assets = FxHashMap::default();
+        for (i, (_, item)) in primary.iter_mut().enumerate() {
+            match *item {
+                ModuleResolveResultItem::Module(m) => {
+                    if let Some(&first) = seen_modules.get(&m) {
+                        *item = ModuleResolveResultItem::Duplicate(first);
+                    } else {
+                        seen_modules.insert(m, i);
+                    }
+                }
+                ModuleResolveResultItem::OutputAsset(a) => {
+                    if let Some(&first) = seen_output_assets.get(&a) {
+                        *item = ModuleResolveResultItem::Duplicate(first);
+                    } else {
+                        seen_output_assets.insert(a, i);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Returns all module results (but ignoring any errors).
     pub fn primary_modules_raw_iter(
         &self,
@@ -296,15 +332,36 @@ impl ModuleResolveResult {
         })
     }
 
-    /// Returns a set (no duplicates) of primary modules in the result.
-    pub async fn primary_modules_ref(&self) -> Result<Vec<ResolvedVc<Box<dyn Module>>>> {
-        let mut set = FxIndexSet::default();
+    /// Returns primary modules (no duplicates). Emits errors for Unknown items.
+    /// Duplicates are already marked at construction time so no extra dedup is
+    /// needed here.
+    pub async fn primary_modules(&self) -> Result<Vec<ResolvedVc<Box<dyn Module>>>> {
+        self.primary
+            .iter()
+            .map(async |(_, item)| item.as_module().await)
+            .try_flat_join()
+            .await
+    }
+
+    /// Returns the first module in the result, or None.
+    pub async fn first_module(&self) -> Result<Option<ResolvedVc<Box<dyn Module>>>> {
         for (_, item) in self.primary.iter() {
             if let Some(module) = item.as_module().await? {
-                set.insert(module);
+                return Ok(Some(module));
             }
         }
-        Ok(set.into_iter().collect())
+        Ok(None)
+    }
+
+    /// Returns primary output assets (no duplicates).
+    pub fn primary_output_assets(&self) -> Vec<ResolvedVc<Box<dyn OutputAsset>>> {
+        self.primary
+            .iter()
+            .filter_map(|(_, item)| match item {
+                &ModuleResolveResultItem::OutputAsset(a) => Some(a),
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn affecting_sources_iter(&self) -> impl Iterator<Item = ResolvedVc<Box<dyn Source>>> + '_ {
@@ -330,8 +387,10 @@ pub struct ModuleResolveResultBuilder {
 
 impl From<ModuleResolveResultBuilder> for ModuleResolveResult {
     fn from(v: ModuleResolveResultBuilder) -> Self {
+        let mut primary: Vec<_> = v.primary.into_iter().collect();
+        Self::mark_duplicates(&mut primary);
         ModuleResolveResult {
-            primary: v.primary.into_iter().collect(),
+            primary: primary.into_boxed_slice(),
             affecting_sources: v.affecting_sources.into_boxed_slice(),
         }
     }
@@ -385,47 +444,6 @@ impl ModuleResolveResult {
         } else {
             Ok(*ModuleResolveResult::unresolvable())
         }
-    }
-
-    #[turbo_tasks::function]
-    pub fn is_unresolvable(&self) -> Vc<bool> {
-        Vc::cell(self.is_unresolvable_ref())
-    }
-
-    #[turbo_tasks::function]
-    pub async fn first_module(&self) -> Result<Vc<OptionModule>> {
-        for (_, item) in self.primary.iter() {
-            if let Some(module) = item.as_module().await? {
-                return Ok(Vc::cell(Some(module)));
-            }
-        }
-        Ok(Vc::cell(None))
-    }
-
-    /// Returns a set (no duplicates) of primary modules in the result. All
-    /// modules are already resolved Vc.
-    #[turbo_tasks::function]
-    pub async fn primary_modules(&self) -> Result<Vc<Modules>> {
-        let mut set = FxIndexSet::default();
-        for (_, item) in self.primary.iter() {
-            if let Some(module) = item.as_module().await? {
-                set.insert(module);
-            }
-        }
-        Ok(Vc::cell(set.into_iter().collect()))
-    }
-
-    #[turbo_tasks::function]
-    pub fn primary_output_assets(&self) -> Vc<OutputAssets> {
-        Vc::cell(
-            self.primary
-                .iter()
-                .filter_map(|(_, item)| match item {
-                    &ModuleResolveResultItem::OutputAsset(a) => Some(a),
-                    _ => None,
-                })
-                .collect(),
-        )
     }
 }
 
@@ -572,7 +590,7 @@ impl ValueToString for ResolveResult {
     #[turbo_tasks::function]
     async fn to_string(&self) -> Result<Vc<RcStr>> {
         let mut result = String::new();
-        if self.is_unresolvable_ref() {
+        if self.is_unresolvable() {
             result.push_str("unresolvable");
         }
         for (i, (request, item)) in self.primary.iter().enumerate() {
@@ -707,8 +725,28 @@ impl ResolveResult {
         self.affecting_sources.iter().copied()
     }
 
-    pub fn is_unresolvable_ref(&self) -> bool {
+    pub fn is_unresolvable(&self) -> bool {
         self.primary.is_empty()
+    }
+
+    pub fn first_source(&self) -> Option<ResolvedVc<Box<dyn Source>>> {
+        self.primary.iter().find_map(|(_, item)| {
+            if let &ResolveResultItem::Source(a) = item {
+                Some(a)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn primary_sources(&self) -> impl Iterator<Item = ResolvedVc<Box<dyn Source>>> {
+        self.primary.iter().filter_map(|(_, item)| {
+            if let &ResolveResultItem::Source(a) = item {
+                Some(a)
+            } else {
+                None
+            }
+        })
     }
 
     pub async fn map_module<A, AF>(&self, source_fn: A) -> Result<ModuleResolveResult>
@@ -949,38 +987,6 @@ impl ResolveResult {
         } else {
             Ok(ResolveResult::unresolvable_with_affecting_sources(affecting_sources).cell())
         }
-    }
-
-    #[turbo_tasks::function]
-    pub fn is_unresolvable(&self) -> Vc<bool> {
-        Vc::cell(self.is_unresolvable_ref())
-    }
-
-    #[turbo_tasks::function]
-    pub fn first_source(&self) -> Vc<OptionSource> {
-        Vc::cell(self.primary.iter().find_map(|(_, item)| {
-            if let &ResolveResultItem::Source(a) = item {
-                Some(a)
-            } else {
-                None
-            }
-        }))
-    }
-
-    #[turbo_tasks::function]
-    pub fn primary_sources(&self) -> Vc<Sources> {
-        Vc::cell(
-            self.primary
-                .iter()
-                .filter_map(|(_, item)| {
-                    if let &ResolveResultItem::Source(a) = item {
-                        Some(a)
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-        )
     }
 
     /// Returns a new [ResolveResult] where all [RequestKey]s are updated. The `old_request_key`
@@ -1678,7 +1684,7 @@ pub async fn resolve_inline(
 #[turbo_tasks::function]
 pub async fn url_resolve(
     origin: Vc<Box<dyn ResolveOrigin>>,
-    request: Vc<Request>,
+    request: ResolvedVc<Request>,
     reference_type: ReferenceType,
     issue_source: Option<IssueSource>,
     error_mode: ResolveErrorMode,
@@ -1693,11 +1699,11 @@ pub async fn url_resolve(
         resolve_options,
     );
     let result =
-        if *rel_result.is_unresolvable().await? && *rel_request.to_resolved().await? != request {
+        if rel_result.await?.is_unresolvable() && rel_request.to_resolved().await? != request {
             let result = resolve(
                 origin_path_parent,
                 reference_type.clone(),
-                request,
+                *request,
                 resolve_options,
             );
             if resolve_options.await?.collect_affecting_sources {
@@ -1721,7 +1727,7 @@ pub async fn url_resolve(
         result,
         reference_type,
         origin,
-        request,
+        *request,
         resolve_options,
         error_mode,
         issue_source,
@@ -1737,10 +1743,12 @@ async fn get_matching_before_resolve_plugins(
     options: Vc<ResolveOptions>,
     request: Vc<Request>,
 ) -> Result<Vc<MatchingBeforeResolvePlugins>> {
+    let request_ref = request.await?;
     let mut matching_plugins = Vec::new();
     for &plugin in &options.await?.before_resolve_plugins {
-        let condition = plugin.before_resolve_condition().to_resolved().await?;
-        if *condition.matches(request).await? {
+        let trait_ref = plugin.into_trait_ref().await?;
+        let condition = trait_ref.before_resolve_condition().await?;
+        if condition.matches(&request_ref) {
             matching_plugins.push(plugin);
         }
     }
@@ -1780,7 +1788,11 @@ async fn handle_after_resolve_plugins(
     let resolved_conditions = options_value
         .after_resolve_plugins
         .iter()
-        .map(async |p| Ok((*p, p.after_resolve_condition().to_resolved().await?)))
+        .map(async |p| {
+            let trait_ref = p.into_trait_ref().await?;
+            let condition = trait_ref.after_resolve_condition().await?;
+            Ok((*p, condition))
+        })
         .try_join()
         .await?;
 
@@ -1792,7 +1804,7 @@ async fn handle_after_resolve_plugins(
         plugins_with_conditions: &[AfterResolvePluginWithCondition],
     ) -> Result<Option<Vc<ResolveResult>>> {
         for (plugin, after_resolve_condition) in plugins_with_conditions {
-            if *after_resolve_condition.matches(path.clone()).await?
+            if after_resolve_condition.matches(&path)
                 && let Some(result) = *plugin
                     .after_resolve(
                         path.clone(),
@@ -2174,7 +2186,7 @@ async fn resolve_internal_inline(
         if !matches!(*request_value, Request::Alternatives { .. }) {
             // Apply fallback import mappings if provided
             if let Some(import_map) = &options_value.fallback_import_map
-                && *result.is_unresolvable().await?
+                && result.await?.is_unresolvable()
             {
                 let result = import_map
                     .await?
@@ -2251,7 +2263,7 @@ async fn resolve_into_folder(
                                 .await?;
                         // we are not that strict when a main field fails to resolve
                         // we continue to try other alternatives
-                        if !result.is_unresolvable_ref() {
+                        if !result.is_unresolvable() {
                             let mut result: ResolveResultBuilder =
                                 result.with_request_ref(rcstr!(".")).into();
                             if options_value.collect_affecting_sources {
@@ -2792,7 +2804,7 @@ async fn resolve_module_request(
             fragment.clone(),
             options,
         );
-        if !(*result.is_unresolvable().await?) {
+        if !result.await?.is_unresolvable() {
             return Ok(result);
         }
     }
@@ -3027,7 +3039,7 @@ async fn resolve_import_map_result(
                     },
                 )
                 .await?
-                .is_unresolvable_ref();
+                .is_unresolvable();
                 if is_external_resolvable {
                     Some(ResolveResultOrCell::Value(ResolveResult::primary(
                         ResolveResultItem::External {
@@ -3091,12 +3103,12 @@ impl ResolveResultOrCell {
     async fn into_cell_if_resolvable(self) -> Result<Option<Vc<ResolveResult>>> {
         match self {
             ResolveResultOrCell::Cell(resolved_result) => {
-                if !*resolved_result.is_unresolvable().await? {
+                if !resolved_result.await?.is_unresolvable() {
                     return Ok(Some(resolved_result));
                 }
             }
             ResolveResultOrCell::Value(resolve_result) => {
-                if !resolve_result.is_unresolvable_ref() {
+                if !resolve_result.is_unresolvable() {
                     return Ok(Some(resolve_result.cell()));
                 }
             }

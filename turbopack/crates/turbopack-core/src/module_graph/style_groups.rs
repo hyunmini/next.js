@@ -12,7 +12,7 @@ use turbo_tasks::{
 
 use crate::{
     chunk::{
-        ChunkItem, ChunkItemBatchWithAsyncModuleInfo, ChunkItemWithAsyncModuleInfo, ChunkType,
+        ChunkItemBatchWithAsyncModuleInfo, ChunkItemWithAsyncModuleInfo, ChunkType,
         ChunkableModule, ChunkingContext, chunk_item_batch::attach_async_info_to_chunkable_module,
     },
     module::{Module, StyleModule, StyleType},
@@ -232,7 +232,7 @@ pub async fn compute_style_groups(
                 chunking_context,
             )
             .await?;
-            let ty = chunk_item.chunk_item.ty();
+            let ty = chunk_item.chunk_item.into_trait_ref().await?.ty();
             let size = *ty
                 .chunk_item_size(chunking_context, *chunk_item.chunk_item, None)
                 .await?;

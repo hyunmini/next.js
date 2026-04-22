@@ -304,6 +304,7 @@ async fn to_single_pattern_mapping(
     origin: Vc<Box<dyn ResolveOrigin>>,
     chunking_context: Vc<Box<dyn ChunkingContext>>,
     resolve_item: &ModuleResolveResultItem,
+    primary: &[(turbopack_core::resolve::RequestKey, ModuleResolveResultItem)],
     resolve_type: ResolveType,
 ) -> Result<SinglePatternMapping> {
     let module = match resolve_item {
@@ -327,6 +328,16 @@ async fn to_single_pattern_mapping(
                     .await?
                     .to_unstyled_string(),
             ));
+        }
+        ModuleResolveResultItem::Duplicate(first) => {
+            return Box::pin(to_single_pattern_mapping(
+                origin,
+                chunking_context,
+                &primary[*first].1,
+                primary,
+                resolve_type,
+            ))
+            .await;
         }
         ModuleResolveResultItem::OutputAsset(_)
         | ModuleResolveResultItem::Empty
@@ -407,25 +418,41 @@ impl PatternMapping {
             .cell()),
             1 if !request.request_pattern().await?.has_dynamic_parts() => {
                 let resolve_item = &result.primary.first().unwrap().1;
-                let single_pattern_mapping =
-                    to_single_pattern_mapping(origin, chunking_context, resolve_item, resolve_type)
-                        .await?;
+                let single_pattern_mapping = to_single_pattern_mapping(
+                    origin,
+                    chunking_context,
+                    resolve_item,
+                    &result.primary,
+                    resolve_type,
+                )
+                .await?;
                 Ok(PatternMapping::Single(single_pattern_mapping).cell())
             }
             _ => {
+                let primary = result.primary.clone();
                 let mut set = HashSet::new();
-                let map = result
-                    .primary
+                let items: Vec<(String, &ModuleResolveResultItem)> = primary
                     .iter()
                     .filter_map(|(k, v)| {
                         let request = k.request.as_ref()?;
                         set.insert(request).then(|| (request.to_string(), v))
                     })
-                    .map(|(k, v)| async move {
-                        let single_pattern_mapping =
-                            to_single_pattern_mapping(origin, chunking_context, v, resolve_type)
-                                .await?;
-                        Ok((k, single_pattern_mapping))
+                    .collect();
+                let map = items
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let primary = primary.clone();
+                        async move {
+                            let single_pattern_mapping = to_single_pattern_mapping(
+                                origin,
+                                chunking_context,
+                                v,
+                                &primary,
+                                resolve_type,
+                            )
+                            .await?;
+                            Ok((k, single_pattern_mapping))
+                        }
                     })
                     .try_join()
                     .await?

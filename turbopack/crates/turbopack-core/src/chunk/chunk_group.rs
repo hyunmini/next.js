@@ -175,14 +175,13 @@ pub async fn references_to_output_assets(
 ) -> Result<Vc<OutputAssetsWithReferenced>> {
     let output_assets = references
         .into_iter()
-        .map(|reference| reference.resolve_reference().primary_output_assets())
+        .map(|reference| async { Ok(reference.resolve_reference().await?.primary_output_assets()) })
         .try_join()
         .await?;
     let mut set = HashSet::new();
     let output_assets = output_assets
-        .iter()
+        .into_iter()
         .flatten()
-        .copied()
         .filter(|&asset| set.insert(asset))
         .collect::<Vec<_>>();
     Ok(OutputAssetsWithReferenced {
