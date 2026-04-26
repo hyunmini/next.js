@@ -8,7 +8,7 @@ pub(crate) mod chunking_context;
 pub(crate) mod data;
 pub(crate) mod evaluate;
 
-use std::fmt::Display;
+use std::{fmt::Display, hash::Hash};
 
 use anyhow::{Result, bail};
 use auto_hash_map::AutoSet;
@@ -516,6 +516,7 @@ impl AsyncModuleInfo {
 )]
 pub struct ChunkItemWithAsyncModuleInfo {
     pub chunk_item: ResolvedVc<Box<dyn ChunkItem>>,
+    pub chunk_type: ResolvedVc<Box<dyn ChunkType>>,
     pub module: Option<ResolvedVc<Box<dyn ChunkableModule>>>,
     pub async_info: Option<ResolvedVc<AsyncModuleInfo>>,
 }

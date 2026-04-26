@@ -84,6 +84,7 @@ async fn batch_size(
         .map(
             |&ChunkItemWithAsyncModuleInfo {
                  chunk_item,
+                 chunk_type: _,
                  async_info,
                  module: _,
              }| {
@@ -106,18 +107,21 @@ async fn plain_chunk_items_with_info(
         ChunkItemOrBatchWithAsyncModuleInfo::ChunkItem(chunk_item_with_info) => {
             let ChunkItemWithAsyncModuleInfo {
                 chunk_item,
+                chunk_type,
                 async_info,
                 module: _,
             } = chunk_item_with_info;
 
             let asset_ident = chunk_item.asset_ident().to_string();
-            let ty = chunk_item.into_trait_ref().await?.ty();
-            let chunk_item_size =
-                ty.chunk_item_size(chunking_context, *chunk_item, async_info.map(|info| *info));
+            let chunk_item_size = chunk_type.chunk_item_size(
+                chunking_context,
+                *chunk_item,
+                async_info.map(|info| *info),
+            );
 
             ChunkItemsWithInfo {
                 by_type: smallvec![(
-                    ty.to_resolved().await?,
+                    chunk_type,
                     smallvec![ChunkItemOrBatchWithInfo::ChunkItem {
                         chunk_item: chunk_item_with_info,
                         size: *chunk_item_size.await?,
@@ -162,6 +166,7 @@ async fn plain_chunk_items_with_info_with_type(
         ChunkItemOrBatchWithAsyncModuleInfo::ChunkItem(chunk_item_with_info) => {
             let &ChunkItemWithAsyncModuleInfo {
                 chunk_item,
+                chunk_type: _,
                 async_info,
                 module: _,
             } = chunk_item_with_info;

@@ -1,5 +1,4 @@
 use anyhow::Result;
-use rustc_hash::FxHashSet;
 use turbo_rcstr::RcStr;
 use turbo_tasks::{ReadRef, ResolvedVc, Vc};
 use turbo_tasks_fs::{FileSystemPath, glob::Glob};
@@ -14,7 +13,7 @@ use crate::{
 /// The glob is read at construction time and stored as a `ReadRef`, so `matches` is a pure
 /// sync function. `serialization = "none"` because `ReadRef` cannot be persisted across builds
 /// — plugin construction is cheap enough that re-deriving this on restore is preferable.
-#[turbo_tasks::value(serialization = "none")]
+#[turbo_tasks::value(serialization = "skip")]
 pub struct AfterResolvePluginCondition {
     root: FileSystemPath,
     glob: ReadRef<Glob>,
@@ -41,21 +40,19 @@ impl AfterResolvePluginCondition {
 /// A condition which determines if the hooks of a resolve plugin gets called.
 ///
 /// The glob (when present) is read at construction time and stored as a `ReadRef`, so
-/// `matches` is a pure sync function. `serialization = "none"` because `ReadRef` cannot be
-/// persisted across builds.
-#[turbo_tasks::value(serialization = "none")]
+/// `matches` is a pure sync function. `serialization = "none"` because `ReadRef` is wasteful to
+/// persist across builds.
+#[turbo_tasks::value(serialization = "skip")]
 pub enum BeforeResolvePluginCondition {
     Request(ReadRef<Glob>),
-    Modules(FxHashSet<RcStr>),
-    Always,
-    Never,
+    Modules(ReadRef<Vec<RcStr>>),
 }
 
 #[turbo_tasks::value_impl]
 impl BeforeResolvePluginCondition {
     #[turbo_tasks::function]
     pub async fn from_modules(modules: ResolvedVc<Vec<RcStr>>) -> Result<Vc<Self>> {
-        Ok(BeforeResolvePluginCondition::Modules(modules.await?.iter().cloned().collect()).cell())
+        Ok(BeforeResolvePluginCondition::Modules(modules.await?).cell())
     }
 
     #[turbo_tasks::function]
@@ -79,8 +76,6 @@ impl BeforeResolvePluginCondition {
                     false
                 }
             }
-            BeforeResolvePluginCondition::Always => true,
-            BeforeResolvePluginCondition::Never => false,
         }
     }
 }

@@ -232,8 +232,8 @@ pub async fn compute_style_groups(
                 chunking_context,
             )
             .await?;
-            let ty = chunk_item.chunk_item.into_trait_ref().await?.ty();
-            let size = *ty
+            let size = *chunk_item
+                .chunk_type
                 .chunk_item_size(chunking_context, *chunk_item.chunk_item, None)
                 .await?;
             Ok((chunk_item, size))

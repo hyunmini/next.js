@@ -113,6 +113,9 @@ pub enum ModuleResolveResultItem {
 }
 
 impl ModuleResolveResultItem {
+    // Returns the module for this item if it is one
+    // NOTE: if this is a `ModuleResolveResultItem::Duplicate` we return `None`, it is expected that
+    // callers will have already found the module earlier.
     async fn as_module(&self) -> Result<Option<ResolvedVc<Box<dyn Module>>>> {
         Ok(match *self {
             ModuleResolveResultItem::Module(module) => Some(module),
@@ -368,7 +371,7 @@ impl ModuleResolveResult {
         self.affecting_sources.iter().copied()
     }
 
-    pub fn is_unresolvable_ref(&self) -> bool {
+    pub fn is_unresolvable(&self) -> bool {
         self.primary.is_empty()
     }
 
@@ -395,19 +398,48 @@ impl From<ModuleResolveResultBuilder> for ModuleResolveResult {
         }
     }
 }
+
+/// Resolves a `Duplicate(i)` marker by looking up the underlying item in `source`.
+/// `mark_duplicates` only ever produces backwards-pointing `Duplicate` indices into
+/// `Module(_)`/`OutputAsset(_)` entries, so a single lookup is enough.
+fn expand_duplicate<'a>(
+    source: &'a [(RequestKey, ModuleResolveResultItem)],
+    item: &'a ModuleResolveResultItem,
+) -> &'a ModuleResolveResultItem {
+    if let ModuleResolveResultItem::Duplicate(i) = *item {
+        &source[i].1
+    } else {
+        item
+    }
+}
+
 impl From<ModuleResolveResult> for ModuleResolveResultBuilder {
     fn from(v: ModuleResolveResult) -> Self {
+        // Expand `Duplicate(i)` markers as we copy into the builder. The indices are valid
+        // for `v.primary`, but the builder's `FxIndexMap` may be re-keyed and merged with
+        // other results, so the indices wouldn't survive. The final
+        // `From<Builder> for ModuleResolveResult` re-runs `mark_duplicates` on the merged
+        // primary array.
+        let primary = v
+            .primary
+            .iter()
+            .map(|(k, item)| (k.clone(), expand_duplicate(&v.primary, item).clone()))
+            .collect();
         ModuleResolveResultBuilder {
-            primary: IntoIterator::into_iter(v.primary).collect(),
+            primary,
             affecting_sources: v.affecting_sources.into_vec(),
         }
     }
 }
 impl ModuleResolveResultBuilder {
     pub fn merge_alternatives(&mut self, other: &ModuleResolveResult) {
+        // Expand `Duplicate(i)` markers from `other` against `other.primary` before
+        // inserting — the indices only make sense within `other`, not within the merged
+        // result. The final `mark_duplicates` pass on conversion will re-derive markers.
         for (k, v) in other.primary.iter() {
             if !self.primary.contains_key(k) {
-                self.primary.insert(k.clone(), v.clone());
+                self.primary
+                    .insert(k.clone(), expand_duplicate(&other.primary, v).clone());
             }
         }
         let set = self
@@ -3842,5 +3874,325 @@ mod tests {
             }
             r => panic!("request should be relative, got {r:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod mark_duplicates_tests {
+    //! Unit tests for `ModuleResolveResult`'s deduplication of `primary` entries via
+    //! `Duplicate(first_index)`. Exercises the public constructors that all funnel through
+    //! `mark_duplicates`.
+    //!
+    //! Each test wraps its body in a `#[turbo_tasks::function(operation)]` and reads the
+    //! result via `read_strongly_consistent()`, matching the existing pattern in the
+    //! `resolve_relative_request` tests above. Reading `Vc`s directly inside `run_once`
+    //! triggers the "eventually consistent read from a top-level task" panic.
+    //!
+    //! The output type is a flat `Vec<DupCheckEntry>` instead of `ModuleResolveResult` itself
+    //! because `ModuleResolveResultItem` is not `TaskInput` (and thus not a valid task return
+    //! shape), and because the assertions only need a structural snapshot of the primary
+    //! array.
+    use turbo_rcstr::{RcStr, rcstr};
+    use turbo_tasks::{ResolvedVc, Vc};
+    use turbo_tasks_backend::{BackendOptions, TurboTasksBackend, noop_backing_storage};
+    use turbo_tasks_fs::{DiskFileSystem, File, FileContent, FileSystem, FileSystemPath};
+
+    use crate::{
+        asset::AssetContent,
+        module::Module,
+        raw_module::RawModule,
+        resolve::{
+            ModuleResolveResult, ModuleResolveResultBuilder, ModuleResolveResultItem, RequestKey,
+        },
+        virtual_source::VirtualSource,
+    };
+
+    /// Snapshot of a `ModuleResolveResult::primary` array, encoded as `Vec<String>` so it
+    /// can cross the strongly-consistent read boundary (operation outputs need to be
+    /// `Encode`/`Decode`). One string per entry:
+    ///   - `module:<path>`  for `Module(_)`
+    ///   - `output_asset`   for `OutputAsset(_)`
+    ///   - `dup:<i>`        for `Duplicate(i)`
+    ///   - `other`          for everything else
+    #[turbo_tasks::value(transparent)]
+    pub struct DupCheckResult(Vec<String>);
+
+    async fn snapshot_primary(result: &ModuleResolveResult) -> anyhow::Result<Vec<String>> {
+        let mut out = Vec::with_capacity(result.primary.len());
+        for (_, item) in result.primary.iter() {
+            out.push(match *item {
+                ModuleResolveResultItem::Module(m) => {
+                    let ident = m.ident().await?;
+                    format!("module:{}", ident.path.path)
+                }
+                ModuleResolveResultItem::OutputAsset(_) => "output_asset".to_string(),
+                ModuleResolveResultItem::Duplicate(i) => format!("dup:{i}"),
+                _ => "other".to_string(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Construct a distinct in-memory `Module` per `name`. `ResolvedVc` identity is what
+    /// `mark_duplicates` keys on, so two different names always yield two distinct
+    /// identities, and the same name yields the same identity (cell-by-content).
+    async fn make_module(
+        fs_root: FileSystemPath,
+        name: &str,
+    ) -> anyhow::Result<ResolvedVc<Box<dyn Module>>> {
+        let path = fs_root.join(name)?;
+        let file_content = FileContent::Content(File::from(format!("// {name}"))).resolved_cell();
+        let content = AssetContent::file(*file_content).to_resolved().await?;
+        let source = VirtualSource::new(path, *content);
+        let module = RawModule::new(Vc::upcast(source)).to_resolved().await?;
+        Ok(ResolvedVc::upcast(module))
+    }
+
+    fn fs_path() -> RcStr {
+        rcstr!("/tmp/_mdt")
+    }
+
+    #[turbo_tasks::function(operation)]
+    async fn modules_constructor_op() -> anyhow::Result<Vc<DupCheckResult>> {
+        let fs = DiskFileSystem::new(rcstr!("temp"), Vc::cell(fs_path()));
+        let root = fs.root().owned().await?;
+        let m_a = make_module(root.clone(), "a.js").await?;
+        let m_b = make_module(root.clone(), "b.js").await?;
+
+        let result = ModuleResolveResult::modules([
+            (RequestKey::new(rcstr!("a")), m_a),
+            (RequestKey::new(rcstr!("b")), m_b),
+            (RequestKey::new(rcstr!("a-again")), m_a),
+            (RequestKey::new(rcstr!("b-again")), m_b),
+        ])
+        .await?;
+
+        // primary_modules() yields each module exactly once, in first-seen order.
+        let modules = result.primary_modules().await?;
+        assert_eq!(modules, vec![m_a, m_b]);
+
+        Ok(Vc::cell(snapshot_primary(&result).await?))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn modules_constructor_marks_module_duplicates() {
+        let tt = turbo_tasks::TurboTasks::new(TurboTasksBackend::new(
+            BackendOptions::default(),
+            noop_backing_storage(),
+        ));
+        tt.run_once(async move {
+            let snap = modules_constructor_op().read_strongly_consistent().await?;
+            assert_eq!(
+                snap.iter().map(String::as_str).collect::<Vec<_>>(),
+                vec!["module:a.js", "module:b.js", "dup:0", "dup:1"]
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[turbo_tasks::function(operation)]
+    async fn first_module_op() -> anyhow::Result<Vc<DupCheckResult>> {
+        let fs = DiskFileSystem::new(rcstr!("temp"), Vc::cell(fs_path()));
+        let root = fs.root().owned().await?;
+        let m = make_module(root.clone(), "a.js").await?;
+
+        let result = ModuleResolveResult::modules([
+            (RequestKey::default(), m),
+            (RequestKey::new(rcstr!("again")), m),
+            (RequestKey::new(rcstr!("once-more")), m),
+        ])
+        .await?;
+
+        assert_eq!(result.first_module().await?, Some(m));
+        assert_eq!(result.primary_modules().await?, vec![m]);
+        Ok(Vc::cell(snapshot_primary(&result).await?))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_module_returns_first_when_duplicates_follow() {
+        let tt = turbo_tasks::TurboTasks::new(TurboTasksBackend::new(
+            BackendOptions::default(),
+            noop_backing_storage(),
+        ));
+        tt.run_once(async move {
+            let snap = first_module_op().read_strongly_consistent().await?;
+            assert_eq!(
+                snap.iter().map(String::as_str).collect::<Vec<_>>(),
+                vec!["module:a.js", "dup:0", "dup:0"]
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[turbo_tasks::function(operation)]
+    async fn distinct_modules_op() -> anyhow::Result<Vc<DupCheckResult>> {
+        let fs = DiskFileSystem::new(rcstr!("temp"), Vc::cell(fs_path()));
+        let root = fs.root().owned().await?;
+        let m_a = make_module(root.clone(), "a.js").await?;
+        let m_b = make_module(root.clone(), "b.js").await?;
+        let m_c = make_module(root.clone(), "c.js").await?;
+
+        let result = ModuleResolveResult::modules([
+            (RequestKey::default(), m_a),
+            (RequestKey::default(), m_b),
+            (RequestKey::default(), m_c),
+        ])
+        .await?;
+        assert_eq!(result.primary_modules().await?, vec![m_a, m_b, m_c]);
+        Ok(Vc::cell(snapshot_primary(&result).await?))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn distinct_modules_are_not_marked_duplicate() {
+        let tt = turbo_tasks::TurboTasks::new(TurboTasksBackend::new(
+            BackendOptions::default(),
+            noop_backing_storage(),
+        ));
+        tt.run_once(async move {
+            let snap = distinct_modules_op().read_strongly_consistent().await?;
+            assert_eq!(
+                snap.iter().map(String::as_str).collect::<Vec<_>>(),
+                vec!["module:a.js", "module:b.js", "module:c.js"]
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Goes through the builder with a non-deduped item between two Module entries to verify
+    /// `Duplicate(i)`'s index points at the previous Module, not at the position of the
+    /// in-between `Empty`. Confirms that only Module/OutputAsset entries consume slots in
+    /// the dedup index space.
+    #[turbo_tasks::function(operation)]
+    async fn builder_with_interleaved_op() -> anyhow::Result<Vc<DupCheckResult>> {
+        let fs = DiskFileSystem::new(rcstr!("temp"), Vc::cell(fs_path()));
+        let root = fs.root().owned().await?;
+        let m = make_module(root.clone(), "a.js").await?;
+
+        let mut builder = ModuleResolveResultBuilder {
+            primary: Default::default(),
+            affecting_sources: Vec::new(),
+        };
+        builder.primary.insert(
+            RequestKey::new(rcstr!("k0")),
+            ModuleResolveResultItem::Module(m),
+        );
+        builder.primary.insert(
+            RequestKey::new(rcstr!("k1")),
+            ModuleResolveResultItem::Empty,
+        );
+        builder.primary.insert(
+            RequestKey::new(rcstr!("k2")),
+            ModuleResolveResultItem::Module(m),
+        );
+        let result: ModuleResolveResult = builder.into();
+        assert_eq!(result.primary_modules().await?, vec![m]);
+        Ok(Vc::cell(snapshot_primary(&result).await?))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn builder_marks_module_duplicates_skipping_non_dedup_items() {
+        let tt = turbo_tasks::TurboTasks::new(TurboTasksBackend::new(
+            BackendOptions::default(),
+            noop_backing_storage(),
+        ));
+        tt.run_once(async move {
+            let snap = builder_with_interleaved_op()
+                .read_strongly_consistent()
+                .await?;
+            // The Duplicate at index 2 references index 0 (the prior Module), not index 1
+            // (the Empty in between).
+            assert_eq!(
+                snap.iter().map(String::as_str).collect::<Vec<_>>(),
+                vec!["module:a.js", "other", "dup:0"]
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// `alternatives()` reads existing `ModuleResolveResult`s — which already carry
+    /// `Duplicate(i)` markers from their own construction — and merges them into a new
+    /// array. The builder expands those markers back to their underlying `Module`/
+    /// `OutputAsset` entries on the way in (`From<ModuleResolveResult> for
+    /// ModuleResolveResultBuilder` and `merge_alternatives`), so the final
+    /// `mark_duplicates` pass sees a clean array and produces correct backward indices.
+    ///
+    /// This test pins the full invariant: `primary_modules()` returns each module exactly
+    /// once, and every `Duplicate(i)` in the merged array points at the same underlying
+    /// module identity (not at some unrelated entry that happens to share an index).
+    #[turbo_tasks::function(operation)]
+    async fn alternatives_op() -> anyhow::Result<Vc<DupCheckResult>> {
+        let fs = DiskFileSystem::new(rcstr!("temp"), Vc::cell(fs_path()));
+        let root = fs.root().owned().await?;
+        let m_a = make_module(root.clone(), "a.js").await?;
+        let m_b = make_module(root.clone(), "b.js").await?;
+
+        // r1 has m_a twice → Module(m_a), Duplicate(0).
+        let r1 = *ModuleResolveResult::modules([
+            (RequestKey::new(rcstr!("k1")), m_a),
+            (RequestKey::new(rcstr!("k2")), m_a),
+        ]);
+        // r2 prepended with m_b so the ordering inside r2 puts m_b at index 0 — a "stale"
+        // 0 from r1 would now incorrectly point at m_b after a naive concatenation.
+        let r2 = *ModuleResolveResult::module(m_b);
+
+        let merged = ModuleResolveResult::alternatives(vec![r1, r2]).await?;
+        assert_eq!(merged.primary_modules().await?, vec![m_a, m_b]);
+
+        // Verify every Duplicate(i) is well-formed: points backwards at a concrete
+        // Module/OutputAsset entry whose underlying identity matches what the duplicate
+        // is supposed to dedup. The duplicate at the position formerly held by r1's
+        // Duplicate(0) must still resolve to m_a, not to m_b.
+        for (i, (_, item)) in merged.primary.iter().enumerate() {
+            if let ModuleResolveResultItem::Duplicate(first) = *item {
+                assert!(
+                    first < i,
+                    "Duplicate index {first} at position {i} must point backwards"
+                );
+                let pointed = &merged.primary[first].1;
+                let ModuleResolveResultItem::Module(pointed_module) = *pointed else {
+                    panic!(
+                        "Duplicate({first}) at {i} points at {pointed:?}, expected a concrete \
+                         Module"
+                    );
+                };
+                // The pointed-at module must be m_a — proves the index was re-derived
+                // against the merged array, not carried stale from r1.
+                assert_eq!(
+                    pointed_module, m_a,
+                    "Duplicate({first}) at position {i} points at the wrong module"
+                );
+            }
+        }
+        Ok(Vc::cell(snapshot_primary(&merged).await?))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alternatives_preserves_unique_module_set() {
+        let tt = turbo_tasks::TurboTasks::new(TurboTasksBackend::new(
+            BackendOptions::default(),
+            noop_backing_storage(),
+        ));
+        tt.run_once(async move {
+            let snap = alternatives_op().read_strongly_consistent().await?;
+            // After expand-then-remark, the merged primary is exactly:
+            //   [Module(m_a), Duplicate(0), Module(m_b)]
+            // — Duplicate(0) is re-derived against the merged array (not carried stale
+            // from r1), and m_b lands cleanly in slot 2.
+            assert_eq!(
+                snap.iter().map(String::as_str).collect::<Vec<_>>(),
+                vec!["module:a.js", "dup:0", "module:b.js"]
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }

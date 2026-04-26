@@ -241,6 +241,7 @@ impl EcmascriptChunkItemWithAsyncInfo {
     ) -> Result<EcmascriptChunkItemWithAsyncInfo> {
         let ChunkItemWithAsyncModuleInfo {
             chunk_item,
+            chunk_type: _,
             module: _,
             async_info,
         } = chunk_item;
