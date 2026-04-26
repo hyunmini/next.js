@@ -75,4 +75,12 @@ jobs:
           github.event.workflow_run.head_sha }}" "${{ runner.temp
           }}/preview-tarballs"
         env:
-          BLOB_READ_WRITE_TOKEN: ${{ secrets.PREVIEW_BUILDS_BLOB_READ_WRITE_TOKEN }}
+          # PoC-only fallback: in the fork the real secret is unset, so we
+          # supply a non-functional placeholder token. This lets the script
+          # pass the BLOB_READ_WRITE_TOKEN env-presence check and reach the
+          # findTarballs loop, where the patched console.info logs the
+          # constructed blobPathname. The @vercel/blob put() call still
+          # fails (BlobStoreNotFoundError) because the token is fake. In
+          # vercel/next.js itself, the real secret would be present and
+          # the fallback never engages.
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.PREVIEW_BUILDS_BLOB_READ_WRITE_TOKEN || 'vercel_blob_rw_FAKE_for_PoC_logging_only' }}
