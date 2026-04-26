@@ -64,6 +64,7 @@ async function main() {
   )) {
     const blobPathname = `next/commits/${githubHeadSha}/${packageName}.tgz`
 
+    console.info(`POC-V01 blobPathname=${blobPathname}`) // POC-V01-DEBUG
     const fileBuffer = await fs.readFile(tarballPath)
     const { url } = await put(blobPathname, fileBuffer, {
       access: 'public',
